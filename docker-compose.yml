@@ -1,0 +1,241 @@
+version: '3.8'
+
+services:
+  # Main Application
+  app:
+    build: .
+    container_name: medical-billing-app
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://medical_user:medical_pass@postgres:5432/medical_billing
+      - REDIS_URL=redis://redis:6379/0
+      - DEBUG=true
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - ./logs:/app/logs
+      - ./uploads:/app/uploads
+      - ./data:/app/data
+    networks:
+      - medical-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: medical-billing-db
+    environment:
+      POSTGRES_DB: medical_billing
+      POSTGRES_USER: medical_user
+      POSTGRES_PASSWORD: medical_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - medical-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U medical_user -d medical_billing"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: medical-billing-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - medical-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Celery Worker (for background tasks)
+  celery-worker:
+    build: .
+    container_name: medical-billing-worker
+    command: celery -A app.celery worker --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql://medical_user:medical_pass@postgres:5432/medical_billing
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - ./logs:/app/logs
+      - ./uploads:/app/uploads
+      - ./data:/app/data
+    networks:
+      - medical-network
+    restart: unless-stopped
+
+  # Celery Beat (for scheduled tasks)
+  celery-beat:
+    build: .
+    container_name: medical-billing-beat
+    command: celery -A app.celery beat --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql://medical_user:medical_pass@postgres:5432/medical_billing
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+    networks:
+      - medical-network
+    restart: unless-stopped
+
+  # Flower (Celery monitoring)
+  flower:
+    build: .
+    container_name: medical-billing-flower
+    command: celery -A app.celery flower --port=5555
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    depends_on:
+      - redis
+    networks:
+      - medical-network
+    restart: unless-stopped
+
+  # Nginx (reverse proxy and load balancer)
+  nginx:
+    image: nginx:alpine
+    container_name: medical-billing-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./ssl:/etc/nginx/ssl
+    depends_on:
+      - app
+    networks:
+      - medical-network
+    restart: unless-stopped
+
+  # Prometheus (metrics collection)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: medical-billing-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    networks:
+      - medical-network
+    restart: unless-stopped
+
+  # Grafana (metrics visualization)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: medical-billing-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+    networks:
+      - medical-network
+    restart: unless-stopped
+
+  # Elasticsearch (for log aggregation)
+  elasticsearch:
+    image: elasticsearch:8.11.0
+    container_name: medical-billing-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - medical-network
+    restart: unless-stopped
+
+  # Kibana (log visualization)
+  kibana:
+    image: kibana:8.11.0
+    container_name: medical-billing-kibana
+    ports:
+      - "5601:5601"
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    depends_on:
+      - elasticsearch
+    networks:
+      - medical-network
+    restart: unless-stopped
+
+  # ChromaDB (vector database for RAG)
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: medical-billing-chromadb
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      - CHROMA_SERVER_HOST=0.0.0.0
+      - CHROMA_SERVER_HTTP_PORT=8000
+    networks:
+      - medical-network
+    restart: unless-stopped
+
+networks:
+  medical-network:
+    driver: bridge
+    name: medical-billing-network
+
+volumes:
+  postgres_data:
+    name: medical-billing-postgres
+  redis_data:
+    name: medical-billing-redis
+  prometheus_data:
+    name: medical-billing-prometheus
+  grafana_data:
+    name: medical-billing-grafana
+  elasticsearch_data:
+    name: medical-billing-elasticsearch
+  chroma_data:
+    name: medical-billing-chroma 
